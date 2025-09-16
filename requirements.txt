@@ -1,0 +1,6 @@
+streamlit
+pandas
+streamlit-quill
+flask
+gunicorn
+openpyxl
