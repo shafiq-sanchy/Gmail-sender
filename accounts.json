@@ -1,0 +1,12 @@
+[
+  {
+    "email": "account1@gmail.com",
+    "password": "app_password_1",
+    "name": "Sender One"
+  },
+  {
+    "email": "account2@gmail.com",
+    "password": "app_password_2",
+    "name": "Sender Two"
+  }
+]
