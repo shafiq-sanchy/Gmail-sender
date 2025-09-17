@@ -12,9 +12,9 @@
     "provider": "gmail"
   },
     {
-    "email": "",
-    "password": "",
-    "name": ""
-    "provider": "gmail"
+    "email": "my.outlook.acc@outlook.com",
+    "password": "outlook_app_password",
+    "name": "My Company Name",
+    "provider": "outlook"
   }
 ]
