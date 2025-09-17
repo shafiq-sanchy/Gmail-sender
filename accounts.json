@@ -15,5 +15,6 @@
     "email": "",
     "password": "",
     "name": ""
+    "provider": "gmail"
   }
 ]
