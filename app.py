@@ -28,21 +28,17 @@ except Exception:
 st.set_page_config(page_title="Bulk Multi-Provider Email Sender", layout="wide")
 st.title("📨 Bulk Multi-Provider Email Sender")
 
-# --- NEW: SMTP Settings for different providers ---
 SMTP_SETTINGS = {
     "gmail": {"host": "smtp.gmail.com", "port": 587},
     "yahoo": {"host": "smtp.mail.yahoo.com", "port": 587},
-    "outlook": {"host": "smtp.office365.com", "port": 587}, # For Outlook, Hotmail, Live
+    "outlook": {"host": "smtp.office365.com", "port": 587},
     "aol": {"host": "smtp.aol.com", "port": 587},
-    "protonmail": {"host": "127.0.0.1", "port": 1025} # Requires Proton Mail Bridge to be running
+    "protonmail": {"host": "127.0.0.1", "port": 1025}
 }
 
-# Filenames
 SENT_LOG_CSV = "sent_log.csv"
 SENT_COUNTERS_JSON = "sent_counters.json"
 MAP_UUID_CSV = "uuid_map.csv"
-
-# Default daily limit
 DEFAULT_DAILY_LIMIT = 450
 
 # -----------------------
@@ -114,7 +110,7 @@ def map_uuid_save(uuid_str, recipient, account_email):
 # UI: Sidebar & Account Loading
 # -----------------------
 st.sidebar.header("Accounts (accounts.json)")
-st.sidebar.info("Please update your `accounts.json` to include a `provider` for each account.")
+st.sidebar.info("Update `accounts.json` to include a `provider` for each account (e.g., 'gmail', 'yahoo').")
 accounts = None
 if os.path.exists("accounts.json"):
     try: accounts = load_accounts_from_file("accounts.json")
@@ -131,17 +127,13 @@ if not accounts:
 
 valid_accounts = []
 for acc in accounts:
-    # --- NEW: Validate 'provider' field ---
-    if all(k in acc for k in ["email", "password", "name", "provider"]):
-        if acc["provider"].lower() in SMTP_SETTINGS:
-            valid_accounts.append(acc)
-        else:
-            st.sidebar.error(f"Account {acc['email']} has an unsupported provider: {acc['provider']}")
+    if all(k in acc for k in ["email", "password", "name", "provider"]) and acc["provider"].lower() in SMTP_SETTINGS:
+        valid_accounts.append(acc)
     else:
         st.sidebar.warning(f"Skipping invalid account entry: {acc.get('email', 'N/A')}")
 
 if not valid_accounts:
-    st.error("No valid accounts found. Ensure each account has 'email', 'password', 'name', and a valid 'provider'.")
+    st.error("No valid accounts found with a supported 'provider'.")
     st.stop()
 
 ensure_sent_counters(valid_accounts)
@@ -151,45 +143,26 @@ daily_limit_per_account = st.sidebar.number_input("Daily limit per account", min
 sleep_seconds = st.sidebar.number_input("Seconds between emails", min_value=0.0, value=1.0, step=0.1)
 
 # -----------------------
-# UI: Main Page - Sender & Compose
+# UI: Main Page
 # -----------------------
 st.header("1. Select Senders & Compose Email")
-
-# --- NEW: Sender Name Input ---
 sender_name_override = st.text_input("Sender Name (Optional, overrides name from account file)")
 
-# --- NEW: Multi-Select for Sender Accounts ---
-account_options = []
-for acc in valid_accounts:
-    sent_today = get_sent_today(acc['email'])
-    label = f"{acc['email']} ({acc['provider']}) - Sent: {sent_today}/{daily_limit_per_account}"
-    account_options.append(label)
-
-selected_account_labels = st.multiselect(
-    "Select sender accounts to use for this campaign:",
-    options=account_options,
-    default=account_options # Select all by default
-)
-
-# Map selected labels back to account objects
+account_options = [f"{acc['email']} ({acc['provider']}) - Sent: {get_sent_today(acc['email'])}/{daily_limit_per_account}" for acc in valid_accounts]
+selected_account_labels = st.multiselect("Select sender accounts to use:", options=account_options, default=account_options)
 selected_accounts = [acc for acc in valid_accounts if f"{acc['email']} ({acc['provider']}) - Sent: {get_sent_today(acc['email'])}/{daily_limit_per_account}" in selected_account_labels]
 
-if not selected_accounts:
-    st.warning("Please select at least one sender account to proceed.")
+if not selected_accounts: st.warning("Please select at least one sender account.")
 
 subject = st.text_input("Subject")
 if 'email_body' not in st.session_state: st.session_state.email_body = ""
-content = st_quill(value=st.session_state.email_body, key="quill_editor", placeholder="Write your email here... Default font and format will look like Gmail.", html=True)
+content = st_quill(value=st.session_state.email_body, key="quill_editor", placeholder="Write your email here...", html=True)
 if content != st.session_state.email_body:
     st.session_state.email_body = content
     st.rerun()
-
 body_html = st.session_state.email_body
 uploaded_attach = st.file_uploader("Optional: Attach File", accept_multiple_files=False)
 
-# -----------------------
-# UI: Recipients
-# -----------------------
 st.header("2. Add Recipients")
 recipients, recipient_name_map = [], {}
 uploaded_recipients = st.file_uploader("Upload CSV/Excel/TXT", type=["csv", "xlsx", "txt"])
@@ -210,13 +183,9 @@ if pasted: recipients.extend([line.strip() for line in pasted.splitlines() if li
 recipients = sanitize_recipients(recipients)
 st.success(f"Loaded {len(recipients)} unique valid recipients")
 
-# -----------------------
-# UI: Tracking & Sending
-# -----------------------
 st.header("3. Tracking & Sending")
-enable_open_tracking = st.checkbox("Enable Email Open Tracking (via webhook.site)", value=True)
-tracker_url = st.text_input("Tracker URL (from webhook.site)", "", help="Go to webhook.site, copy the unique URL, and paste it here. No signup needed.")
-st.info("For click tracking, use a URL shortener like Bitly and paste the shortened link directly in the email body.")
+enable_open_tracking = st.checkbox("Enable Email Open Tracking (Optional)", value=False)
+tracker_url = st.text_input("Tracker URL (from webhook.site)", "", help="Go to webhook.site, copy the URL, and paste it here. No signup needed.")
 
 # -----------------------
 # Logic: Build & Send
@@ -228,12 +197,11 @@ def build_message(sender_name, sender_email, to_email, subject, html_body, attac
     msg['Subject'] = subject
     
     final_html = html_body
-    if enable_open_tracking and tracker_url:
-        pixel_url = f"{tracker_url}?id={uuid_id}&r={to_email}"
+    # --- MODIFIED: Only add pixel if tracking is enabled AND URL is provided ---
+    if enable_open_tracking and tracker_url.strip():
+        pixel_url = f"{tracker_url.strip()}?id={uuid_id}&r={to_email}"
         final_html += f'<img src="{pixel_url}" width="1" height="1" style="display:none; border:0;" alt=""/>'
     
-    # --- NEW: Removed wrapper div for default alignment ---
-    # The HTML will now render naturally in email clients.
     msg.attach(MIMEText(final_html, 'html', 'utf-8'))
     
     if attach_file:
@@ -246,17 +214,12 @@ def build_message(sender_name, sender_email, to_email, subject, html_body, attac
     return msg
 
 def send_via_smtp(account, msg, to_email):
-    # --- NEW: Dynamic SMTP settings based on provider ---
     provider = account['provider'].lower()
-    if provider not in SMTP_SETTINGS:
-        return False, f"SMTP settings for provider '{provider}' not found."
-    
-    settings = SMTP_SETTINGS[provider]
-    host = settings['host']
-    port = settings['port']
+    settings = SMTP_SETTINGS.get(provider)
+    if not settings: return False, f"SMTP settings for '{provider}' not found."
     
     try:
-        with smtplib.SMTP(host, port, timeout=60) as server:
+        with smtplib.SMTP(settings['host'], settings['port'], timeout=60) as server:
             server.starttls()
             server.login(account["email"], account["password"])
             server.sendmail(account["email"], [to_email], msg.as_string())
@@ -265,9 +228,9 @@ def send_via_smtp(account, msg, to_email):
         return False, str(e)
 
 if st.button("🚀 Send Emails"):
+    # --- MODIFIED: Removed mandatory check for tracker URL ---
     if not subject or not body_html or not recipients: st.error("Subject, body, and recipients are required.")
     elif not selected_accounts: st.error("Please select at least one sender account.")
-    elif enable_open_tracking and not tracker_url: st.error("Please provide a Tracker URL from webhook.site.")
     else:
         total_sent, status_rows = 0, []
         progress = st.progress(0)
@@ -276,21 +239,17 @@ if st.button("🚀 Send Emails"):
         account_idx = 0
         for i, recipient in enumerate(recipients):
             account = None
-            # Find the next available account from the *selected* list
             for _ in range(len(selected_accounts)):
                 candidate = selected_accounts[account_idx % len(selected_accounts)]
                 if get_sent_today(candidate["email"]) < daily_limit_per_account:
                     account = candidate; account_idx += 1; break
                 account_idx += 1
             
-            if account is None: st.error("All selected accounts have hit their daily limit. Stopping."); break
+            if account is None: st.error("All selected accounts have hit their daily limit."); break
             
-            # --- NEW: Use sender name override or default ---
-            sender_name = sender_name_override.strip() if sender_name_override.strip() else account['name']
-            
+            sender_name = sender_name_override.strip() or account['name']
             to_name = recipient_name_map.get(recipient, "")
             personalized_body = body_html.replace("[Recipient Name]", to_name)
-            
             uuid_id = str(uuid.uuid4())
             map_uuid_save(uuid_id, recipient, account["email"])
             
