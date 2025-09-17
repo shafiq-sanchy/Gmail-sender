@@ -197,11 +197,38 @@ for acc in valid_accounts:
 # -----------------------
 st.header("Compose Email")
 subject = st.text_input("Subject", value="")
-if QUILL_AVAILABLE:
-    body_html = st_quill(placeholder="Write email body (HTML allowed). Use [Recipient Name] to personalize.", html=True)
-else:
-    st.info("streamlit_quill not found — using simple textarea for HTML body.")
-    body_html = st.text_area("Email Body (HTML allowed). Use [Recipient Name] to personalize.", height=300)
+
+# Initialize session state for email body
+if 'email_body' not in st.session_state:
+    st.session_state.email_body = ""
+
+# --- NEW: DUAL EDITOR ---
+editor_mode = st.radio("Editor Mode", ["Visual (Recommended)", "HTML (Advanced)"], horizontal=True)
+
+if editor_mode == "Visual (Recommended)":
+    if QUILL_AVAILABLE:
+        st.session_state.email_body = st_quill(
+            value=st.session_state.email_body,
+            placeholder="Write email body. Use [Recipient Name] to personalize.",
+            html=True
+        )
+    else:
+        st.info("streamlit_quill not found — using simple textarea. You can still write HTML.")
+        st.session_state.email_body = st.text_area(
+            "Email Body (HTML allowed). Use [Recipient Name] to personalize.",
+            value=st.session_state.email_body,
+            height=300
+        )
+else: # HTML Editor Mode
+    st.session_state.email_body = st.text_area(
+        "Edit Raw HTML Body. Use [Recipient Name] to personalize.",
+        value=st.session_state.email_body,
+        height=400,
+        help="Paste your full HTML code here. Good for templates from other tools."
+    )
+
+# Get the final body content from session state
+body_html = st.session_state.email_body
 
 st.markdown("**Tip**: include an unsubscribe line and follow local email laws. Use `[Recipient Name]` placeholder if you want personalization.")
 
@@ -300,18 +327,31 @@ if enable_tracking and not tracker_base_url:
 # -----------------------
 # Send logic
 # -----------------------
-def build_message(sender_name, sender_email, to_email, subject, html_body, attach_file=None, uuid_id=None):
+def build_message(sender_name, sender_email, to_email, subject, html_body, attach_file=None, uuid_id=None, is_advanced_html=False):
     msg = MIMEMultipart()
     msg['From'] = formataddr((sender_name, sender_email))
     msg['To'] = to_email
     msg['Subject'] = subject
-    body = html_body
+
+    # --- UPDATED: APPLY DEFAULT STYLING ---
+    final_body = html_body
+    # Only wrap with default styles if it's not advanced HTML (i.e., doesn't contain <html> or <body> tags)
+    if not is_advanced_html:
+        final_body = f"""
+        <div style="font-family: Arial, sans-serif; font-size: 16px; line-height: 1.6; color: #333333; max-width: 600px; margin: auto; padding: 20px;">
+            {html_body}
+        </div>
+        """
+
+    # Add tracking pixel if enabled
     if uuid_id and tracker_base_url:
-        # add tracking pixel appended at end
         pixel_url = f"{tracker_base_url.strip()}?id={uuid_id}&r={to_email}"
-        pixel_tag = f'<img src="{pixel_url}" width="1" height="1" style="display:none;" alt="" />'
-        body = body + "\n\n" + pixel_tag
-    msg.attach(MIMEText(body, 'html'))
+        pixel_tag = f'<img src="{pixel_url}" width="1" height="1" style="display:none; border:0;" alt="" />'
+        final_body += "\n\n" + pixel_tag
+
+    msg.attach(MIMEText(final_body, 'html', 'utf-8'))
+
+    # Attach file if provided
     if attach_file:
         try:
             filename = attach_file.name
@@ -327,18 +367,21 @@ def build_message(sender_name, sender_email, to_email, subject, html_body, attac
 
 def send_via_smtp(account, msg, to_email):
     try:
-        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=60)
-        server.ehlo()
-        server.starttls()
-        server.login(account["email"], account["password"])
-        server.sendmail(account["email"], [to_email], msg.as_string())
-        server.quit()
+        # Use a context manager for the SMTP connection
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=60) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(account["email"], account["password"])
+            server.sendmail(account["email"], [to_email], msg.as_string())
         return True, None
     except Exception as e:
         return False, str(e)
 
 # Send button
 if st.button("🚀 Send Emails"):
+    # Re-fetch body from session state in case the button click caused a rerun
+    body_html = st.session_state.email_body
+    
     if not subject or not body_html or not recipients:
         st.error("Please provide subject, body and recipients")
     elif len(recipients) > 1000 and not confirm_large:
@@ -347,6 +390,11 @@ if st.button("🚀 Send Emails"):
         total = len(recipients)
         progress = st.progress(0)
         status_rows = []
+        status_placeholder = st.empty()
+        
+        # Determine if the user has provided a full HTML document
+        is_advanced_html = '<html' in body_html.lower() or '<body' in body_html.lower()
+
         # compute rotated accounts order but always check daily limit
         account_idx = 0
         for i, recipient in enumerate(recipients):
@@ -378,7 +426,16 @@ if st.button("🚀 Send Emails"):
             map_uuid_save(uuid_id, recipient, account["email"])
 
             # Build message
-            msg = build_message(account["name"], account["email"], recipient, subject, personalized_body, uploaded_attach, uuid_id if enable_tracking else None)
+            msg = build_message(
+                account["name"],
+                account["email"],
+                recipient,
+                subject,
+                personalized_body,
+                uploaded_attach,
+                uuid_id if enable_tracking else None,
+                is_advanced_html=is_advanced_html
+            )
 
             # send
             ok, err = send_via_smtp(account, msg, recipient)
@@ -396,12 +453,17 @@ if st.button("🚀 Send Emails"):
                 update_sent_counter(account["email"], delta=1)
             status_rows.append(row)
 
-            # progress & throttle
+            # Update UI
             progress.progress((i + 1) / total)
-            time.sleep(float(sleep_seconds))
+            status_placeholder.text(f"Sending {i+1}/{total} to {recipient}... Status: {'OK' if ok else 'FAIL'}")
 
+            # throttle
+            time.sleep(float(sleep_seconds))
+        
+        status_placeholder.empty()
         st.success("Send loop finished (some may have failed). See log and download below.")
         st.dataframe(pd.DataFrame(status_rows))
+        
         # download logs
         with open(SENT_LOG_CSV, "rb") as f:
             st.download_button("Download send log (CSV)", data=f, file_name=SENT_LOG_CSV)
