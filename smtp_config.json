@@ -1,0 +1,14 @@
+{
+  "my_company_smtp": {
+    "host": "smtp.yourcompany.com",
+    "port": 587
+  },
+  "sendgrid": {
+    "host": "smtp.sendgrid.net",
+    "port": 587
+  },
+  "mailgun": {
+    "host": "smtp.mailgun.org",
+    "port": 587
+  }
+}
