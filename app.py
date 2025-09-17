@@ -298,4 +298,151 @@ st.success(f"Loaded {len(recipients)} unique valid recipients")
 personalize = st.checkbox("Personalize with recipient name (attempt to extract name from CSV or 'Name <email>')", value=False)
 recipient_name_map = {}
 if personalize:
-  
+    if uploaded_recipients:
+        try:
+            df2 = pd.read_csv(uploaded_recipients, header=None, dtype=str, keep_default_na=False) if uploaded_recipients.name.endswith(".csv") or uploaded_recipients.name.endswith(".txt") else pd.read_excel(uploaded_recipients, header=None, dtype=str)
+            if df2.shape[1] >= 2:
+                for idx, row in df2.iterrows():
+                    email = str(row[0]).strip()
+                    name = str(row[1]).strip()
+                    if is_valid_email(email) and name:
+                        recipient_name_map[email] = name
+        except Exception:
+            pass
+
+# Safety checks
+st.markdown("### Safety checks")
+st.write(f"- Accounts available: {len(valid_accounts)}")
+st.write(f"- Daily limit per account: {daily_limit_per_account}")
+st.write(f"- Throttle (sleep) between sends: {sleep_seconds} seconds")
+
+confirm_large = False
+if len(recipients) > 1000:
+    st.warning("Large send detected (>1000). Confirm you want to proceed.")
+    confirm_large = st.checkbox("I confirm I want to proceed with a large send (>1000). I understand deliverability and legal implications.")
+
+# Tracking
+st.subheader("Tracking")
+enable_tracking = st.checkbox("Enable open tracking (insert invisible pixel)", value=True)
+tracker_base_url = st.text_input("Tracker base URL (e.g. https://your-tracker.herokuapp.com/track.png)", value="")
+
+if enable_tracking and not tracker_base_url:
+    st.info("Provide the tracker base URL to collect open events (deploy tracker app separately).")
+
+# -----------------------
+# Send logic
+# -----------------------
+def build_message(sender_name, sender_email, to_email, subject, html_body, attach_file=None, uuid_id=None):
+    msg = MIMEMultipart('alternative')
+    msg['From'] = formataddr((sender_name, sender_email))
+    msg['To'] = to_email
+    msg['Subject'] = subject
+
+    is_advanced_html = '<html' in html_body.lower() or '<body' in html_body.lower()
+
+    final_body = html_body
+    if not is_advanced_html:
+        final_body = f"""
+        <div style="font-family: Arial, sans-serif; font-size: 16px; line-height: 1.6; color: #333333; max-width: 600px; margin: auto; padding: 20px;">
+            {html_body}
+        </div>
+        """
+    
+    if uuid_id and tracker_base_url:
+        pixel_url = f"{tracker_base_url.strip()}?id={uuid_id}&r={to_email}"
+        pixel_tag = f'<img src="{pixel_url}" width="1" height="1" style="display:none; border:0;" alt="" />'
+        final_body += "\n" + pixel_tag
+
+    msg.attach(MIMEText(final_body, 'html', 'utf-8'))
+
+    if attach_file:
+        part = MIMEBase('application', 'octet-stream')
+        attach_file.seek(0)
+        part.set_payload(attach_file.read())
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f'attachment; filename="{attach_file.name}"')
+        # Create a new MIMEMultipart and attach both HTML and attachment
+        outer = MIMEMultipart()
+        outer.attach(msg)
+        outer.attach(part)
+        # Copy headers from the original msg
+        for k, v in msg.items():
+            outer[k] = v
+        return outer
+
+    return msg
+
+def send_via_smtp(account, msg, to_email):
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=60) as server:
+            server.starttls()
+            server.login(account["email"], account["password"])
+            server.sendmail(account["email"], [to_email], msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+if st.button("🚀 Send Emails"):
+    if not subject or not st.session_state.email_body or not recipients:
+        st.error("Please provide subject, body and recipients")
+    elif len(recipients) > 1000 and not confirm_large:
+        st.error("Please confirm large send")
+    else:
+        total = len(recipients)
+        progress = st.progress(0)
+        status_rows = []
+        status_placeholder = st.empty()
+        
+        account_idx = 0
+        for i, recipient in enumerate(recipients):
+            tried = 0
+            account = None
+            while tried < len(valid_accounts):
+                candidate = valid_accounts[account_idx % len(valid_accounts)]
+                sent_today = get_sent_today(candidate["email"])
+                if sent_today < daily_limit_per_account:
+                    account = candidate
+                    account_idx = (account_idx + 1) % len(valid_accounts)
+                    break
+                else:
+                    account_idx = (account_idx + 1) % len(valid_accounts)
+                    tried += 1
+            if account is None:
+                st.error("All accounts have hit their daily limit. Stopping send.")
+                break
+
+            to_name = recipient_name_map.get(recipient, "")
+            personalized_body = st.session_state.email_body.replace("[Recipient Name]", to_name if to_name else "")
+            
+            uuid_id = str(uuid.uuid4())
+            map_uuid_save(uuid_id, recipient, account["email"])
+
+            msg = build_message(
+                account["name"], account["email"], recipient, subject,
+                personalized_body, uploaded_attach, uuid_id if enable_tracking else None
+            )
+
+            ok, err = send_via_smtp(account, msg, recipient)
+            timestamp = datetime.utcnow().isoformat()
+            row = {
+                "timestamp": timestamp, "recipient": recipient, "account": account["email"],
+                "uuid": uuid_id, "status": "sent" if ok else "failed", "error": "" if ok else str(err)
+            }
+            append_sent_log(row)
+            if ok:
+                update_sent_counter(account["email"], delta=1)
+            status_rows.append(row)
+            
+            progress.progress((i + 1) / total)
+            status_placeholder.text(f"Sending {i+1}/{total} to {recipient}... Status: {'OK' if ok else 'FAIL'}")
+            time.sleep(float(sleep_seconds))
+
+        status_placeholder.empty()
+        st.success("Send loop finished. See log and download below.")
+        st.dataframe(pd.DataFrame(status_rows))
+        
+        with open(SENT_LOG_CSV, "rb") as f:
+            st.download_button("Download send log (CSV)", data=f, file_name=SENT_LOG_CSV)
+        if os.path.exists(MAP_UUID_CSV):
+            with open(MAP_UUID_CSV, "rb") as f:
+                st.download_button("Download UUID map (CSV)", data=f, file_name=MAP_UUID_CSV)
