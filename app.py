@@ -202,30 +202,44 @@ subject = st.text_input("Subject", value="")
 if 'email_body' not in st.session_state:
     st.session_state.email_body = ""
 
-# --- NEW: DUAL EDITOR ---
-editor_mode = st.radio("Editor Mode", ["Visual (Recommended)", "HTML (Advanced)"], horizontal=True)
+# --- IMPROVED DUAL EDITOR WITH ROBUST STATE MANAGEMENT ---
+editor_mode = st.radio("Editor Mode", ["Visual (Recommended)", "HTML (Advanced)"], horizontal=True, key="editor_mode")
 
 if editor_mode == "Visual (Recommended)":
     if QUILL_AVAILABLE:
-        st.session_state.email_body = st_quill(
+        # Using a key ensures the component's state is preserved across reruns
+        content = st_quill(
             value=st.session_state.email_body,
+            key="quill_editor",
             placeholder="Write email body. Use [Recipient Name] to personalize.",
             html=True
         )
+        if content != st.session_state.email_body:
+            st.session_state.email_body = content
+            st.rerun() # Rerun to ensure the state is immediately reflected
     else:
         st.info("streamlit_quill not found — using simple textarea. You can still write HTML.")
-        st.session_state.email_body = st.text_area(
+        content = st.text_area(
             "Email Body (HTML allowed). Use [Recipient Name] to personalize.",
             value=st.session_state.email_body,
+            key="simple_editor",
             height=300
         )
+        if content != st.session_state.email_body:
+            st.session_state.email_body = content
+            st.rerun()
+
 else: # HTML Editor Mode
-    st.session_state.email_body = st.text_area(
+    content = st.text_area(
         "Edit Raw HTML Body. Use [Recipient Name] to personalize.",
         value=st.session_state.email_body,
+        key="html_editor",
         height=400,
         help="Paste your full HTML code here. Good for templates from other tools."
     )
+    if content != st.session_state.email_body:
+        st.session_state.email_body = content
+        st.rerun()
 
 # Get the final body content from session state
 body_html = st.session_state.email_body
@@ -253,7 +267,6 @@ if uploaded_recipients:
             df = pd.read_csv(uploaded_recipients, header=None, dtype=str, keep_default_na=False)
         else:
             df = pd.read_excel(uploaded_recipients, header=None, dtype=str)
-        # take all non-null text in first column
         recipients = df.iloc[:,0].astype(str).tolist()
     except Exception as e:
         st.error(f"Failed to parse uploaded recipients: {e}")
@@ -262,20 +275,16 @@ if uploaded_recipients:
 if pasted:
     pasted_lines = [line.strip() for line in pasted.splitlines() if line.strip()]
     if paste_has_names:
-        # try parse email from patterns
         parsed = []
         for line in pasted_lines:
-            # formats: Name <email@domain.com> or email,Name
             if "<" in line and ">" in line:
                 email = line.split("<")[1].split(">")[0].strip()
                 parsed.append(email)
             elif "," in line:
                 parts = [p.strip() for p in line.split(",") if p.strip()]
-                # pick first that looks like email
                 email = next((p for p in parts if is_valid_email(p)), parts[0] if parts else "")
                 parsed.append(email)
             else:
-                # fallback to whole line
                 parsed.append(line)
         recipients += parsed
     else:
@@ -285,189 +294,8 @@ if pasted:
 recipients = sanitize_recipients(recipients)
 st.success(f"Loaded {len(recipients)} unique valid recipients")
 
-# Personalization option: recipient name mapping
+# Personalization option
 personalize = st.checkbox("Personalize with recipient name (attempt to extract name from CSV or 'Name <email>')", value=False)
 recipient_name_map = {}
 if personalize:
-    # try to build map from uploaded file if it had second column
-    if uploaded_recipients:
-        try:
-            df2 = pd.read_csv(uploaded_recipients, header=None, dtype=str, keep_default_na=False) if uploaded_recipients.name.endswith(".csv") or uploaded_recipients.name.endswith(".txt") else pd.read_excel(uploaded_recipients, header=None, dtype=str)
-            if df2.shape[1] >= 2:
-                for idx, row in df2.iterrows():
-                    email = str(row[0]).strip()
-                    name = str(row[1]).strip()
-                    if is_valid_email(email) and name:
-                        recipient_name_map[email] = name
-        except Exception:
-            pass
-
-# Preview & safety confirmations
-st.markdown("### Safety checks")
-st.write("- Duplicate recipients removed")
-st.write(f"- Accounts available: {len(valid_accounts)}")
-st.write(f"- Daily limit per account: {daily_limit_per_account}")
-st.write(f"- Throttle (sleep) between sends: {sleep_seconds} seconds")
-
-confirm_large = False
-if len(recipients) > 1000:
-    st.warning("Large send detected (>1000). Confirm you want to proceed.")
-    confirm_large = st.checkbox("I confirm I want to proceed with a large send (>1000). I understand deliverability and legal implications.")
-
-# -----------------------
-# Build tracking pixel (optional)
-# -----------------------
-st.subheader("Tracking")
-enable_tracking = st.checkbox("Enable open tracking (insert invisible pixel)", value=True)
-tracker_base_url = st.text_input("Tracker base URL (e.g. https://your-tracker.herokuapp.com/track.png)", value="")
-
-if enable_tracking and not tracker_base_url:
-    st.info("Provide the tracker base URL to collect open events (deploy tracker app separately).")
-
-# -----------------------
-# Send logic
-# -----------------------
-def build_message(sender_name, sender_email, to_email, subject, html_body, attach_file=None, uuid_id=None, is_advanced_html=False):
-    msg = MIMEMultipart()
-    msg['From'] = formataddr((sender_name, sender_email))
-    msg['To'] = to_email
-    msg['Subject'] = subject
-
-    # --- UPDATED: APPLY DEFAULT STYLING ---
-    final_body = html_body
-    # Only wrap with default styles if it's not advanced HTML (i.e., doesn't contain <html> or <body> tags)
-    if not is_advanced_html:
-        final_body = f"""
-        <div style="font-family: Arial, sans-serif; font-size: 16px; line-height: 1.6; color: #333333; max-width: 600px; margin: auto; padding: 20px;">
-            {html_body}
-        </div>
-        """
-
-    # Add tracking pixel if enabled
-    if uuid_id and tracker_base_url:
-        pixel_url = f"{tracker_base_url.strip()}?id={uuid_id}&r={to_email}"
-        pixel_tag = f'<img src="{pixel_url}" width="1" height="1" style="display:none; border:0;" alt="" />'
-        final_body += "\n\n" + pixel_tag
-
-    msg.attach(MIMEText(final_body, 'html', 'utf-8'))
-
-    # Attach file if provided
-    if attach_file:
-        try:
-            filename = attach_file.name
-            part = MIMEBase('application', 'octet-stream')
-            attach_file.seek(0)
-            part.set_payload(attach_file.read())
-            encoders.encode_base64(part)
-            part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
-            msg.attach(part)
-        except Exception as e:
-            st.error(f"Failed to attach file: {e}")
-    return msg
-
-def send_via_smtp(account, msg, to_email):
-    try:
-        # Use a context manager for the SMTP connection
-        with smtplib.SMTP('smtp.gmail.com', 587, timeout=60) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(account["email"], account["password"])
-            server.sendmail(account["email"], [to_email], msg.as_string())
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-# Send button
-if st.button("🚀 Send Emails"):
-    # Re-fetch body from session state in case the button click caused a rerun
-    body_html = st.session_state.email_body
-    
-    if not subject or not body_html or not recipients:
-        st.error("Please provide subject, body and recipients")
-    elif len(recipients) > 1000 and not confirm_large:
-        st.error("Please confirm large send")
-    else:
-        total = len(recipients)
-        progress = st.progress(0)
-        status_rows = []
-        status_placeholder = st.empty()
-        
-        # Determine if the user has provided a full HTML document
-        is_advanced_html = '<html' in body_html.lower() or '<body' in body_html.lower()
-
-        # compute rotated accounts order but always check daily limit
-        account_idx = 0
-        for i, recipient in enumerate(recipients):
-            # pick next available account that hasn't reached daily limit
-            tried = 0
-            account = None
-            while tried < len(valid_accounts):
-                candidate = valid_accounts[account_idx % len(valid_accounts)]
-                sent_today = get_sent_today(candidate["email"])
-                if sent_today < daily_limit_per_account:
-                    account = candidate
-                    account_idx = (account_idx + 1) % len(valid_accounts)
-                    break
-                else:
-                    account_idx = (account_idx + 1) % len(valid_accounts)
-                    tried += 1
-            if account is None:
-                st.error("All accounts have hit their daily limit. Stopping send.")
-                break
-
-            # personalization
-            to_name = ""
-            if personalize:
-                to_name = recipient_name_map.get(recipient, "")
-            personalized_body = body_html.replace("[Recipient Name]", to_name if to_name else "")
-
-            # Build uuid for tracking & map
-            uuid_id = str(uuid.uuid4())
-            map_uuid_save(uuid_id, recipient, account["email"])
-
-            # Build message
-            msg = build_message(
-                account["name"],
-                account["email"],
-                recipient,
-                subject,
-                personalized_body,
-                uploaded_attach,
-                uuid_id if enable_tracking else None,
-                is_advanced_html=is_advanced_html
-            )
-
-            # send
-            ok, err = send_via_smtp(account, msg, recipient)
-            timestamp = datetime.utcnow().isoformat()
-            row = {
-                "timestamp": timestamp,
-                "recipient": recipient,
-                "account": account["email"],
-                "uuid": uuid_id,
-                "status": "sent" if ok else "failed",
-                "error": "" if ok else str(err)
-            }
-            append_sent_log(row)
-            if ok:
-                update_sent_counter(account["email"], delta=1)
-            status_rows.append(row)
-
-            # Update UI
-            progress.progress((i + 1) / total)
-            status_placeholder.text(f"Sending {i+1}/{total} to {recipient}... Status: {'OK' if ok else 'FAIL'}")
-
-            # throttle
-            time.sleep(float(sleep_seconds))
-        
-        status_placeholder.empty()
-        st.success("Send loop finished (some may have failed). See log and download below.")
-        st.dataframe(pd.DataFrame(status_rows))
-        
-        # download logs
-        with open(SENT_LOG_CSV, "rb") as f:
-            st.download_button("Download send log (CSV)", data=f, file_name=SENT_LOG_CSV)
-        # also provide uuid map
-        if os.path.exists(MAP_UUID_CSV):
-            with open(MAP_UUID_CSV, "rb") as f:
-                st.download_button("Download UUID map (CSV)", data=f, file_name=MAP_UUID_CSV)
+  
