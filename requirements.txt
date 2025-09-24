@@ -4,3 +4,6 @@ streamlit-quill
 flask
 gunicorn
 openpyxl
+redis
+rq
+rq-scheduler
