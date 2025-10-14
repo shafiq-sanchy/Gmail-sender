@@ -270,50 +270,84 @@ def send_via_smtp(account, msg, to_email):
     except Exception as e:
         return False, str(e)
 
-if st.button("🚀 Send Emails"):
-    if not all([subject, body_html, recipients]): st.error("Subject, body, and recipients are required.")
-    elif not selected_accounts: st.error("Please select at least one sender account.")
+# ---- Replace the existing send loop with this safer version ----
+if st.button(" Send Emails"):
+    if not all([subject, body_html, recipients]):
+        st.error("Subject, body, and recipients are required.")
+    elif not selected_accounts:
+        st.error("Please select at least one sender account.")
     else:
-        total_sent, status_rows = 0, []
-        progress = st.progress(0)
+        total_sent = 0
+        status_rows = []
+        progress_bar = st.progress(0)
         status_placeholder = st.empty()
-        
         account_idx = 0
-        for i, recipient in enumerate(recipients):
-            account = None
-            for _ in range(len(selected_accounts)):
-                candidate = selected_accounts[account_idx % len(selected_accounts)]
-                if get_sent_today(candidate["email"]) < daily_limit_per_account:
-                    account = candidate; account_idx += 1; break
-                account_idx += 1
-            
-            if account is None: st.error("All selected accounts have hit their daily limit."); break
-            
-            sender_name = sender_name_override.strip() or account['name']
-            to_name = recipient_name_map.get(recipient, "")
-            personalized_body = body_html.replace("[Recipient Name]", to_name)
-            uuid_id = str(uuid.uuid4())
-            map_uuid_save(uuid_id, recipient, account["email"])
-            
-            msg = build_message(sender_name, account["email"], recipient, subject, personalized_body, uploaded_attach, uuid_id)
-            ok, err = send_via_smtp(account, msg, recipient)
-            
-            row = { "timestamp": datetime.utcnow().isoformat(), "recipient": recipient, "account": account["email"], "uuid": uuid_id, "status": "sent" if ok else "failed", "error": str(err) if err else "" }
-            append_sent_log(row)
-            status_rows.append(row)
 
-            if ok: update_sent_counter(account["email"]); total_sent += 1
+        try:
+            for i, recipient in enumerate(recipients):
+                # pick an account that still has capacity
+                account = None
+                for _ in range(len(selected_accounts)):
+                    candidate = selected_accounts[account_idx % len(selected_accounts)]
+                    account_idx += 1
+                    if get_sent_today(candidate["email"]) < daily_limit_per_account:
+                        account = candidate
+                        break
 
-            progress.progress((i + 1) / len(recipients))
-            status_placeholder.text(f"Sending {i+1}/{len(recipients)} to {recipient} via {account['email']}... Status: {'OK' if ok else 'FAIL'}")
-            time.sleep(float(sleep_seconds))
+                if account is None:
+                    st.error("All selected accounts have hit their daily limit.")
+                    break
 
-        status_placeholder.empty()
-        st.success(f"Send loop finished. Successfully sent {total_sent} emails.")
-        st.dataframe(pd.DataFrame(status_rows))
-        
-        # Download buttons
-        if os.path.exists(SENT_LOG_CSV):
-            with open(SENT_LOG_CSV, "rb") as f: st.download_button("Download Send Log (CSV)", data=f, file_name=SENT_LOG_CSV)
-        if os.path.exists(MAP_UUID_CSV):
-            with open(MAP_UUID_CSV, "rb") as f: st.download_button("Download UUID Map (CSV)", data=f, file_name=MAP_UUID_CSV)
+                sender_name = sender_name_override.strip() or account['name']
+                to_name = recipient_name_map.get(recipient, "")
+                personalized_body = body_html.replace("[Recipient Name]", to_name)
+                uuid_id = str(uuid.uuid4())
+                map_uuid_save(uuid_id, recipient, account["email"])
+
+                msg = build_message(sender_name, account["email"], recipient, subject, personalized_body, uploaded_attach, uuid_id)
+
+                # send and capture status
+                ok, err = send_via_smtp(account, msg, recipient)
+
+                row = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "recipient": recipient,
+                    "account": account["email"],
+                    "uuid": uuid_id,
+                    "status": "sent" if ok else "failed",
+                    "error": str(err) if err else ""
+                }
+                append_sent_log(row)
+                status_rows.append(row)
+
+                if ok:
+                    update_sent_counter(account["email"])
+                    total_sent += 1
+                # Update progress in percent (0..100) to avoid streamlit version ambiguity
+                try:
+                    pct = int((i + 1) * 100 / len(recipients))
+                except Exception:
+                    pct = min(100, (i + 1))  # fallback
+                progress_bar.progress(pct)
+
+                # show per-item status (do NOT immediately empty; let users see it)
+                status_placeholder.text(f"Sending {i+1}/{len(recipients)} to {recipient} via {account['email']}... Status: {'OK' if ok else 'FAIL'}")
+                # keep respectful delay
+                time.sleep(float(sleep_seconds))
+
+        except Exception as ex:
+            # Any unexpected exception will be shown so user knows why it stopped
+            st.error(f"An unexpected error occurred during sending: {ex}")
+        finally:
+            # show summary and table regardless of earlier exception
+            status_placeholder.empty()
+            st.success(f"Send loop finished. Successfully sent {total_sent} emails (out of {len(recipients)} attempted).")
+            st.dataframe(pd.DataFrame(status_rows))
+
+            # Download buttons (same as before)
+            if os.path.exists(SENT_LOG_CSV):
+                with open(SENT_LOG_CSV, "rb") as f:
+                    st.download_button("Download Send Log (CSV)", data=f, file_name=SENT_LOG_CSV)
+            if os.path.exists(MAP_UUID_CSV):
+                with open(MAP_UUID_CSV, "rb") as f:
+                    st.download_button("Download UUID Map (CSV)", data=f, file_name=MAP_UUID_CSV)
