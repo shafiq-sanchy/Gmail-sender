@@ -246,10 +246,13 @@ def add_unsubscribe_footer(html_body, sender_email, recipient_email, recipient_n
     
     footer = f"""
     <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; text-align: center; font-size: 12px; color: #666;">
-        <p>Don't want to receive these emails? <a href="{unsubscribe_link}" style="color: #0066cc; text-decoration: none;">Unsubscribe</a></p>
+        <p>If you wish to no longer receive our email, you can <a href="{unsubscribe_link}" style="color: #0066cc; text-decoration: none;">remove yourself</a> from our list at any time.</p>
+        <p>100 Highland Park Vlg, Dallas, TX 75205, United States</p>
     </div>
     """
-    
+     
+
+10420 SW 104th St Miami, Fl
     return html_body + footer
 
 # -----------------------
