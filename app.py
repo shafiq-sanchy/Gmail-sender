@@ -252,7 +252,6 @@ def add_unsubscribe_footer(html_body, sender_email, recipient_email, recipient_n
     """
      
 
-10420 SW 104th St Miami, Fl
     return html_body + footer
 
 # -----------------------
