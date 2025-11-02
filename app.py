@@ -29,7 +29,6 @@ st.set_page_config(page_title="Advanced Bulk Email Sender", layout="wide")
 st.title("📨 Advanced Bulk Email Sender")
 
 # --- Default SMTP Settings ---
-# These are used if smtp_config.json is not found
 DEFAULT_SMTP_SETTINGS = {
     "gmail": {"host": "smtp.gmail.com", "port": 587},
     "yahoo": {"host": "smtp.mail.yahoo.com", "port": 587},
@@ -44,6 +43,8 @@ SENT_COUNTERS_JSON = "sent_counters.json"
 MAP_UUID_CSV = "uuid_map.csv"
 SMTP_CONFIG_JSON = "smtp_config.json"
 DEFAULT_DAILY_LIMIT = 450
+MAX_RETRIES = 3
+RATE_LIMIT_WAIT = 60  # seconds to wait on rate limit
 
 # -----------------------
 # Helper utils
@@ -113,7 +114,6 @@ def get_sent_today(email_address):
     if email_address not in counters or counters[email_address].get("date") != today_str: return 0
     return counters[email_address].get("sent_today", 0)
 
-# Other helper functions for logging remain unchanged...
 def append_sent_log(row_dict):
     file_exists = os.path.exists(SENT_LOG_CSV)
     with open(SENT_LOG_CSV, "a", newline='', encoding="utf-8") as csvfile:
@@ -127,6 +127,37 @@ def map_uuid_save(uuid_str, recipient, account_email):
         writer = csv.writer(csvfile)
         if not file_exists: writer.writerow(["uuid", "recipient", "account", "timestamp"])
         writer.writerow([uuid_str, recipient, account_email, datetime.utcnow().isoformat()])
+
+# -----------------------
+# NEW: Improved Account Selection Logic
+# -----------------------
+def get_next_available_account(accounts, daily_limit):
+    """
+    Returns the next available account that hasn't hit its daily limit.
+    Uses round-robin selection among accounts sorted by least usage.
+    Returns None if all accounts are exhausted.
+    """
+    available = []
+    for acc in accounts:
+        sent = get_sent_today(acc["email"])
+        if sent < daily_limit:
+            available.append((acc, sent))
+    
+    if not available:
+        return None
+    
+    # Sort by least used first
+    available.sort(key=lambda x: x[1])
+    return available[0][0]
+
+def is_rate_limit_error(error_msg):
+    """Check if error message indicates rate limiting."""
+    rate_limit_indicators = [
+        "rate limit", "too many", "quota", "429", 
+        "temporarily blocked", "slow down", "limit exceeded"
+    ]
+    error_lower = str(error_msg).lower()
+    return any(indicator in error_lower for indicator in rate_limit_indicators)
 
 # -----------------------
 # UI: Sidebar & Account Loading
@@ -174,18 +205,21 @@ ensure_sent_counters(valid_accounts)
 
 st.sidebar.header("Sending Controls")
 daily_limit_per_account = st.sidebar.number_input("Daily send limit per account", min_value=1, value=DEFAULT_DAILY_LIMIT)
-sleep_seconds = st.sidebar.number_input("Delay between emails (seconds)", min_value=0.0, value=1.0, step=0.1)
+sleep_seconds = st.sidebar.number_input("Delay between emails (seconds)", min_value=0.0, value=2.0, step=0.1)
+batch_size = st.sidebar.number_input("Batch size (emails per batch)", min_value=10, value=50, step=10)
+batch_delay = st.sidebar.number_input("Delay between batches (seconds)", min_value=0, value=10, step=1)
 
 # -----------------------
 # UI: Main Page
 # -----------------------
 st.header("1. Senders & Email Content")
 
-# --- RESTORED: Detailed display for sender selection ---
+# Account selection with detailed info
 account_map = {}
 for acc in valid_accounts:
     sent_today = get_sent_today(acc['email'])
-    label = f"{acc['email']} ({acc['provider']}) — Sent: {sent_today} / {daily_limit_per_account}"
+    remaining = daily_limit_per_account - sent_today
+    label = f"{acc['email']} ({acc['provider']}) — Sent: {sent_today}/{daily_limit_per_account} (Remaining: {remaining})"
     account_map[label] = acc
 
 selected_labels = st.multiselect(
@@ -195,7 +229,12 @@ selected_labels = st.multiselect(
 )
 selected_accounts = [account_map[label] for label in selected_labels]
 
-if not selected_accounts: st.warning("Please select at least one sender account.")
+if not selected_accounts: 
+    st.warning("Please select at least one sender account.")
+
+# Show total capacity
+total_capacity = sum(max(0, daily_limit_per_account - get_sent_today(acc['email'])) for acc in selected_accounts)
+st.info(f"📊 Total remaining capacity across selected accounts: **{total_capacity}** emails")
 
 sender_name_override = st.text_input("Sender Name (Optional, overrides name from account file)")
 subject = st.text_input("Subject")
@@ -209,25 +248,31 @@ uploaded_attach = st.file_uploader("Optional: Attach File", accept_multiple_file
 
 st.header("2. Recipients")
 recipients, recipient_name_map = [], {}
-# ... (Recipient loading logic remains unchanged) ...
 uploaded_recipients = st.file_uploader("Upload CSV/Excel/TXT", type=["csv", "xlsx", "txt"])
 if uploaded_recipients:
     try:
-        if uploaded_recipients.name.endswith((".csv", ".txt")): df = pd.read_csv(uploaded_recipients, header=None, dtype=str, keep_default_na=False)
-        else: df = pd.read_excel(uploaded_recipients, header=None, dtype=str)
+        if uploaded_recipients.name.endswith((".csv", ".txt")): 
+            df = pd.read_csv(uploaded_recipients, header=None, dtype=str, keep_default_na=False)
+        else: 
+            df = pd.read_excel(uploaded_recipients, header=None, dtype=str)
         emails = [str(e).strip() for e in df.iloc[:, 0].tolist()]
         recipients.extend(emails)
         if df.shape[1] >= 2:
             names = [str(n).strip() for n in df.iloc[:, 1].tolist()]
             for email, name in zip(emails, names):
-                if is_valid_email(email) and name: recipient_name_map[email.lower()] = name
-    except Exception as e: st.error(f"Failed to parse uploaded file: {e}")
+                if is_valid_email(email) and name: 
+                    recipient_name_map[email.lower()] = name
+    except Exception as e: 
+        st.error(f"Failed to parse uploaded file: {e}")
 
 pasted = st.text_area("Or paste emails (one per line):", height=150)
-if pasted: recipients.extend([line.strip() for line in pasted.splitlines() if line.strip()])
+if pasted: 
+    recipients.extend([line.strip() for line in pasted.splitlines() if line.strip()])
 recipients = sanitize_recipients(recipients)
-st.success(f"Loaded {len(recipients)} unique valid recipients")
+st.success(f"✅ Loaded {len(recipients)} unique valid recipients")
 
+if len(recipients) > total_capacity:
+    st.warning(f"⚠️ You have {len(recipients)} recipients but only {total_capacity} sending capacity remaining today!")
 
 st.header("3. Tracking & Sending")
 enable_open_tracking = st.checkbox("Enable Email Open Tracking (Optional)", value=False)
@@ -251,103 +296,181 @@ def build_message(sender_name, sender_email, to_email, subject, html_body, attac
     
     if attach_file:
         part = MIMEBase('application', 'octet-stream')
-        attach_file.seek(0); part.set_payload(attach_file.read()); encoders.encode_base64(part)
+        attach_file.seek(0)
+        part.set_payload(attach_file.read())
+        encoders.encode_base64(part)
         part.add_header('Content-Disposition', f'attachment; filename="{attach_file.name}"')
         msg.attach(part)
     return msg
 
-def send_via_smtp(account, msg, to_email):
+def send_via_smtp(account, msg, to_email, retry_count=0):
+    """Send email with retry logic for rate limiting."""
     provider = account['provider'].lower()
     settings = ALL_SMTP_SETTINGS.get(provider)
-    if not settings: return False, f"SMTP settings for '{provider}' not found."
+    if not settings: 
+        return False, f"SMTP settings for '{provider}' not found.", False
     
     try:
         with smtplib.SMTP(settings['host'], settings['port'], timeout=60) as server:
             server.starttls()
             server.login(account["email"], account["password"])
             server.sendmail(account["email"], [to_email], msg.as_string())
-        return True, None
+        return True, None, False
     except Exception as e:
-        return False, str(e)
+        error_msg = str(e)
+        is_rate_limited = is_rate_limit_error(error_msg)
+        
+        # Retry on rate limit
+        if is_rate_limited and retry_count < MAX_RETRIES:
+            return False, error_msg, True  # True indicates should retry
+        
+        return False, error_msg, False
 
-# ---- Replace the existing send loop with this safer version ----
-if st.button(" Send Emails"):
+# -----------------------
+# IMPROVED SEND LOOP
+# -----------------------
+if st.button("📤 Send Emails"):
     if not all([subject, body_html, recipients]):
-        st.error("Subject, body, and recipients are required.")
+        st.error("❌ Subject, body, and recipients are required.")
     elif not selected_accounts:
-        st.error("Please select at least one sender account.")
+        st.error("❌ Please select at least one sender account.")
     else:
         total_sent = 0
+        total_failed = 0
         status_rows = []
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
-        account_idx = 0
-
+        
+        # Track account usage in this session
+        session_usage = {acc['email']: 0 for acc in selected_accounts}
+        
         try:
-            for i, recipient in enumerate(recipients):
-                # pick an account that still has capacity
-                account = None
-                for _ in range(len(selected_accounts)):
-                    candidate = selected_accounts[account_idx % len(selected_accounts)]
-                    account_idx += 1
-                    if get_sent_today(candidate["email"]) < daily_limit_per_account:
-                        account = candidate
+            # Process in batches
+            num_batches = (len(recipients) + batch_size - 1) // batch_size
+            
+            for batch_num in range(num_batches):
+                batch_start = batch_num * batch_size
+                batch_end = min(batch_start + batch_size, len(recipients))
+                batch_recipients = recipients[batch_start:batch_end]
+                
+                st.info(f"🔄 Processing batch {batch_num + 1}/{num_batches} ({len(batch_recipients)} emails)")
+                
+                for i, recipient in enumerate(batch_recipients):
+                    overall_index = batch_start + i
+                    
+                    # Get next available account
+                    account = get_next_available_account(selected_accounts, daily_limit_per_account)
+                    
+                    if account is None:
+                        st.error("🚫 All selected accounts have reached their daily limit!")
+                        st.warning(f"✅ Sent: {total_sent} | ❌ Failed: {total_failed} | ⏭️ Skipped: {len(recipients) - overall_index}")
                         break
-
-                if account is None:
-                    st.error("All selected accounts have hit their daily limit.")
-                    break
-
-                sender_name = sender_name_override.strip() or account['name']
-                to_name = recipient_name_map.get(recipient, "")
-                personalized_body = body_html.replace("[Recipient Name]", to_name)
-                uuid_id = str(uuid.uuid4())
-                map_uuid_save(uuid_id, recipient, account["email"])
-
-                msg = build_message(sender_name, account["email"], recipient, subject, personalized_body, uploaded_attach, uuid_id)
-
-                # send and capture status
-                ok, err = send_via_smtp(account, msg, recipient)
-
-                row = {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "recipient": recipient,
-                    "account": account["email"],
-                    "uuid": uuid_id,
-                    "status": "sent" if ok else "failed",
-                    "error": str(err) if err else ""
-                }
-                append_sent_log(row)
-                status_rows.append(row)
-
-                if ok:
-                    update_sent_counter(account["email"])
-                    total_sent += 1
-                # Update progress in percent (0..100) to avoid streamlit version ambiguity
-                try:
-                    pct = int((i + 1) * 100 / len(recipients))
-                except Exception:
-                    pct = min(100, (i + 1))  # fallback
-                progress_bar.progress(pct)
-
-                # show per-item status (do NOT immediately empty; let users see it)
-                status_placeholder.text(f"Sending {i+1}/{len(recipients)} to {recipient} via {account['email']}... Status: {'OK' if ok else 'FAIL'}")
-                # keep respectful delay
-                time.sleep(float(sleep_seconds))
-
+                    
+                    sender_name = sender_name_override.strip() or account['name']
+                    to_name = recipient_name_map.get(recipient.lower(), "")
+                    personalized_body = body_html.replace("[Recipient Name]", to_name)
+                    uuid_id = str(uuid.uuid4())
+                    map_uuid_save(uuid_id, recipient, account["email"])
+                    
+                    msg = build_message(sender_name, account["email"], recipient, subject, 
+                                      personalized_body, uploaded_attach, uuid_id)
+                    
+                    # Send with retry logic
+                    retry_count = 0
+                    ok, err, should_retry = False, None, False
+                    
+                    while retry_count <= MAX_RETRIES:
+                        ok, err, should_retry = send_via_smtp(account, msg, recipient, retry_count)
+                        
+                        if ok:
+                            break
+                        elif should_retry:
+                            retry_count += 1
+                            st.warning(f"⏳ Rate limit detected for {account['email']}. Waiting {RATE_LIMIT_WAIT}s before retry {retry_count}/{MAX_RETRIES}...")
+                            time.sleep(RATE_LIMIT_WAIT)
+                        else:
+                            break
+                    
+                    # Log result
+                    row = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "recipient": recipient,
+                        "account": account["email"],
+                        "uuid": uuid_id,
+                        "status": "sent" if ok else "failed",
+                        "error": str(err) if err else "",
+                        "retries": retry_count
+                    }
+                    append_sent_log(row)
+                    status_rows.append(row)
+                    
+                    if ok:
+                        update_sent_counter(account["email"])
+                        session_usage[account["email"]] += 1
+                        total_sent += 1
+                    else:
+                        total_failed += 1
+                    
+                    # Update progress
+                    pct = int((overall_index + 1) * 100 / len(recipients))
+                    progress_bar.progress(pct)
+                    
+                    # Show status
+                    sent_from_account = get_sent_today(account['email'])
+                    status_placeholder.text(
+                        f"📧 {overall_index + 1}/{len(recipients)} → {recipient} via {account['email']} "
+                        f"({sent_from_account}/{daily_limit_per_account}) | {'✅ OK' if ok else '❌ FAIL'}"
+                    )
+                    
+                    # Delay between emails
+                    time.sleep(float(sleep_seconds))
+                
+                # Delay between batches
+                if batch_num < num_batches - 1:
+                    st.info(f"⏸️ Batch complete. Waiting {batch_delay}s before next batch...")
+                    time.sleep(batch_delay)
+        
         except Exception as ex:
-            # Any unexpected exception will be shown so user knows why it stopped
-            st.error(f"An unexpected error occurred during sending: {ex}")
+            st.error(f"💥 Unexpected error: {ex}")
+        
         finally:
-            # show summary and table regardless of earlier exception
             status_placeholder.empty()
-            st.success(f"Send loop finished. Successfully sent {total_sent} emails (out of {len(recipients)} attempted).")
+            progress_bar.progress(100)
+            
+            # Final summary
+            st.success(f"✅ **Sending Complete!**")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("✅ Sent", total_sent)
+            with col2:
+                st.metric("❌ Failed", total_failed)
+            with col3:
+                st.metric("📊 Total", len(recipients))
+            
+            # Show account usage
+            st.subheader("📈 Account Usage This Session")
+            usage_data = []
+            for acc in selected_accounts:
+                sent_before = get_sent_today(acc['email']) - session_usage[acc['email']]
+                sent_now = session_usage[acc['email']]
+                total_today = get_sent_today(acc['email'])
+                usage_data.append({
+                    "Account": acc['email'],
+                    "Provider": acc['provider'],
+                    "Sent (This Session)": sent_now,
+                    "Total Today": total_today,
+                    "Remaining": daily_limit_per_account - total_today
+                })
+            st.dataframe(pd.DataFrame(usage_data))
+            
+            # Show detailed results
+            st.subheader("📋 Detailed Results")
             st.dataframe(pd.DataFrame(status_rows))
-
-            # Download buttons (same as before)
+            
+            # Download buttons
             if os.path.exists(SENT_LOG_CSV):
                 with open(SENT_LOG_CSV, "rb") as f:
-                    st.download_button("Download Send Log (CSV)", data=f, file_name=SENT_LOG_CSV)
+                    st.download_button("⬇️ Download Send Log (CSV)", data=f, file_name=SENT_LOG_CSV)
             if os.path.exists(MAP_UUID_CSV):
                 with open(MAP_UUID_CSV, "rb") as f:
-                    st.download_button("Download UUID Map (CSV)", data=f, file_name=MAP_UUID_CSV)
+                    st.download_button("⬇️ Download UUID Map (CSV)", data=f, file_name=MAP_UUID_CSV)
