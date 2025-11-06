@@ -1,5 +1,5 @@
 {
-  "turbo": {
+  "turboSMTP": {
     "host": "pro.turbo-smtp.com",
     "port": 587
   },
