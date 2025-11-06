@@ -1,0 +1,17 @@
+{
+  "accounts": [
+    {
+      "username": "9f1b36e85c",
+      "password": "GLPZqdSuRnUvKhp64fgY",
+      "from_email": "noreply@yourdomain.com",
+      "from_name": "Your Company",
+      "provider": "turbosmtp"
+    },
+    {
+      "email": "MS_obeRJR@mikelin.shop",
+      "password": "mssp.9TKab4K.351ndgw31jq4zqx8.aUXP567",
+      "name": "Your Brand",
+      "provider": "mailersend"
+    }
+  ]
+}
