@@ -1,6 +1,6 @@
 {
-  "my_company_smtp": {
-    "host": "smtp.yourcompany.com",
+  "turbo": {
+    "host": "pro.turbo-smtp.com",
     "port": 587
   },
   "sendgrid": {
