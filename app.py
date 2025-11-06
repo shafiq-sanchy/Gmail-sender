@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import re
@@ -26,16 +25,20 @@ except Exception:
 # -----------------------
 # Config / Constants
 # -----------------------
-st.set_page_config(page_title="Advanced Bulk Email Sender", layout="wide")
-st.title("📨 Advanced Bulk Email Sender")
+st.set_page_config(page_title="Advanced Multi-SMTP Bulk Email Sender", layout="wide")
+st.title("📨 Advanced Multi-SMTP Bulk Email Sender")
 
 # --- Default SMTP Settings ---
 DEFAULT_SMTP_SETTINGS = {
-    "gmail": {"host": "smtp.gmail.com", "port": 587},
-    "yahoo": {"host": "smtp.mail.yahoo.com", "port": 587},
-    "outlook": {"host": "smtp.office365.com", "port": 587},
-    "aol": {"host": "smtp.aol.com", "port": 587},
-    "protonmail": {"host": "127.0.0.1", "port": 1025}
+    "gmail": {"host": "smtp.gmail.com", "port": 587, "use_tls": True},
+    "yahoo": {"host": "smtp.mail.yahoo.com", "port": 587, "use_tls": True},
+    "outlook": {"host": "smtp.office365.com", "port": 587, "use_tls": True},
+    "aol": {"host": "smtp.aol.com", "port": 587, "use_tls": True},
+    "protonmail": {"host": "127.0.0.1", "port": 1025, "use_tls": True},
+    "resend": {"host": "smtp.resend.com", "port": 587, "use_tls": True},
+    "mailersend": {"host": "smtp.mailersend.net", "port": 587, "use_tls": True},
+    "sendgrid": {"host": "smtp.sendgrid.net", "port": 587, "use_tls": True},
+    "mailgun": {"host": "smtp.mailgun.org", "port": 587, "use_tls": True}
 }
 
 # Filenames
@@ -44,8 +47,8 @@ SENT_COUNTERS_JSON = "sent_counters.json"
 MAP_UUID_CSV = "uuid_map.csv"
 SMTP_CONFIG_JSON = "smtp_config.json"
 PROGRESS_STATE_JSON = "progress_state.json"
-DEFAULT_DAILY_LIMIT = 450
-MAX_RETRIES = 2  # Reduced retries
+DEFAULT_DAILY_LIMIT = 5000  # Increased for SMTP services
+MAX_RETRIES = 1  # Quick retry only
 
 # Session state for control buttons
 if 'is_paused' not in st.session_state:
@@ -162,41 +165,50 @@ def load_progress_state():
     return None
 
 # -----------------------
-# Account Management
+# SMTP Account Manager
 # -----------------------
-class AccountManager:
+class SMTPAccountManager:
     def __init__(self, accounts, daily_limit):
         self.accounts = accounts
         self.daily_limit = daily_limit
-        self.rate_limited_accounts = set()  # Skip these accounts
+        self.rate_limited_accounts = set()
+        self.failed_accounts = set()
+        self.current_index = 0
         
     def mark_rate_limited(self, email):
         """Mark account as rate limited and skip it."""
         self.rate_limited_accounts.add(email)
-        st.warning(f"🚫 {email} marked as rate limited. Skipping this account.")
+        st.warning(f"⚠️ Rate Limited: {email} - Switching to next account...")
+    
+    def mark_failed(self, email, reason):
+        """Mark account as failed (auth error etc)."""
+        self.failed_accounts.add(email)
+        st.error(f"❌ Failed: {email} - {reason}")
     
     def get_next_available_account(self):
-        """Get next available account (not rate limited, under limit)."""
-        available = []
-        for acc in self.accounts:
+        """Rotate through accounts, skip rate limited ones."""
+        attempts = 0
+        
+        while attempts < len(self.accounts):
+            acc = self.accounts[self.current_index]
             email = acc["email"]
             
-            # Skip if rate limited or over daily limit
-            if email in self.rate_limited_accounts:
+            # Move to next account for rotation
+            self.current_index = (self.current_index + 1) % len(self.accounts)
+            attempts += 1
+            
+            # Skip if rate limited or failed
+            if email in self.rate_limited_accounts or email in self.failed_accounts:
                 continue
             
+            # Check daily limit
             sent = get_sent_today(email)
             if sent >= self.daily_limit:
                 continue
             
-            available.append((acc, sent))
+            return acc, None
         
-        if not available:
-            return None, "All accounts exhausted or rate limited"
-        
-        # Sort by least used
-        available.sort(key=lambda x: x[1])
-        return available[0][0], None
+        return None, "All accounts exhausted, rate limited, or failed"
     
     def get_status(self):
         """Get status of all accounts."""
@@ -204,26 +216,46 @@ class AccountManager:
         for acc in self.accounts:
             email = acc["email"]
             sent = get_sent_today(email)
-            is_rate_limited = email in self.rate_limited_accounts
+            
+            if email in self.failed_accounts:
+                status_text = "❌ Failed"
+            elif email in self.rate_limited_accounts:
+                status_text = "🔴 Rate Limited"
+            elif sent >= self.daily_limit:
+                status_text = "⚪ Limit Reached"
+            else:
+                status_text = "🟢 Active"
             
             status.append({
                 "email": email,
+                "provider": acc.get("provider", "unknown"),
                 "sent": sent,
                 "limit": self.daily_limit,
                 "remaining": max(0, self.daily_limit - sent),
-                "status": "🔴 Rate Limited" if is_rate_limited else "🟢 Active"
+                "status": status_text
             })
         return status
 
 def is_rate_limit_error(error_msg):
     """Check if error indicates rate limiting."""
     rate_indicators = [
-        "rate limit", "too many", "quota", "429",
+        "rate limit", "too many", "quota", "429", "421",
         "temporarily blocked", "slow down", "limit exceeded",
-        "daily limit", "hourly limit"
+        "daily limit", "hourly limit", "throttle",
+        "exceeded", "maximum", "try again later"
     ]
     error_lower = str(error_msg).lower()
     return any(ind in error_lower for ind in rate_indicators)
+
+def is_auth_error(error_msg):
+    """Check if error is authentication related."""
+    auth_indicators = [
+        "authentication failed", "invalid credentials", "auth",
+        "username and password not accepted", "login failed",
+        "bad credentials", "535", "535 5.7.8"
+    ]
+    error_lower = str(error_msg).lower()
+    return any(ind in error_lower for ind in auth_indicators)
 
 # -----------------------
 # Unsubscribe Link Generator
@@ -250,67 +282,121 @@ def add_unsubscribe_footer(html_body, sender_email, recipient_email, recipient_n
         <p>100 Highland Park Vlg, Dallas, TX 75205, United States</p>
     </div>
     """
-     
-
     return html_body + footer
 
 # -----------------------
 # UI: Sidebar
 # -----------------------
-st.sidebar.header("⚙️ Accounts & Settings")
+st.sidebar.header("⚙️ Account Management")
 
-with st.sidebar.expander("ℹ️ How to add custom SMTP"):
-    st.markdown("Create `smtp_config.json` with your provider details.")
-    st.code('''{"provider": {"host": "smtp.example.com", "port": 587}}''', language="json")
+# Section 1: Gmail Accounts
+st.sidebar.subheader("📧 Gmail Accounts")
+gmail_accounts = []
+uploaded_gmail = st.sidebar.file_uploader("Upload Gmail accounts.json", type=["json"], key="gmail_upload")
+if uploaded_gmail:
+    try:
+        gmail_accounts = json.load(uploaded_gmail)
+        st.sidebar.success(f"✅ Loaded {len(gmail_accounts)} Gmail accounts")
+    except Exception as e:
+        st.sidebar.error(f"Gmail JSON error: {e}")
+elif os.path.exists("gmail_accounts.json"):
+    try:
+        gmail_accounts = load_accounts_from_file("gmail_accounts.json")
+        st.sidebar.info(f"📁 Using gmail_accounts.json ({len(gmail_accounts)} accounts)")
+    except Exception as e:
+        st.sidebar.error(f"Error loading gmail_accounts.json: {e}")
+
+# Section 2: SMTP Server Accounts
+st.sidebar.subheader("🚀 SMTP Servers (Resend, Mailersend, etc)")
+smtp_accounts = []
+uploaded_smtp = st.sidebar.file_uploader("Upload SMTP servers.json", type=["json"], key="smtp_upload")
+if uploaded_smtp:
+    try:
+        smtp_accounts = json.load(uploaded_smtp)
+        st.sidebar.success(f"✅ Loaded {len(smtp_accounts)} SMTP servers")
+    except Exception as e:
+        st.sidebar.error(f"SMTP JSON error: {e}")
+elif os.path.exists("smtp_servers.json"):
+    try:
+        smtp_accounts = load_accounts_from_file("smtp_servers.json")
+        st.sidebar.info(f"📁 Using smtp_servers.json ({len(smtp_accounts)} servers)")
+    except Exception as e:
+        st.sidebar.error(f"Error loading smtp_servers.json: {e}")
+
+with st.sidebar.expander("ℹ️ SMTP JSON Format Example"):
+    st.code('''{
+  "accounts": [
+    {
+      "email": "noreply@yourdomain.com",
+      "password": "re_xxx_api_key",
+      "name": "Your Company",
+      "provider": "resend"
+    },
+    {
+      "email": "hello@yourdomain.com", 
+      "password": "ms-xxx_api_key",
+      "name": "Support Team",
+      "provider": "mailersend"
+    }
+  ]
+}''', language="json")
 
 with st.sidebar.expander("📧 Unsubscribe Feature"):
     st.markdown("""
     **How it works:**
     - Automatic footer added to all emails
-    - Click opens email client with pre-filled unsubscribe request
-    - Recipient's info auto-filled in email body
-    - Unsubscribe request sent to sender's email
+    - Click opens email client with pre-filled request
+    - Recipient info auto-filled
     """)
 
-accounts = None
-uploaded_accounts = st.sidebar.file_uploader("Upload accounts.json", type=["json"])
-if uploaded_accounts:
-    try: accounts = json.load(uploaded_accounts)
-    except Exception as e: st.sidebar.error(f"Invalid JSON: {e}"); accounts = None
-elif os.path.exists("accounts.json"):
-    try: accounts = load_accounts_from_file("accounts.json")
-    except Exception as e: st.sidebar.error(f"Failed to load accounts.json: {e}")
+# Combine all accounts
+all_accounts = []
 
-if not accounts:
-    st.warning("No accounts loaded. Please create or upload an `accounts.json` file.")
+# Add Gmail accounts
+if gmail_accounts:
+    if isinstance(gmail_accounts, dict) and "accounts" in gmail_accounts:
+        all_accounts.extend(gmail_accounts["accounts"])
+    elif isinstance(gmail_accounts, list):
+        all_accounts.extend(gmail_accounts)
+
+# Add SMTP accounts
+if smtp_accounts:
+    if isinstance(smtp_accounts, dict) and "accounts" in smtp_accounts:
+        all_accounts.extend(smtp_accounts["accounts"])
+    elif isinstance(smtp_accounts, list):
+        all_accounts.extend(smtp_accounts)
+
+if not all_accounts:
+    st.warning("⚠️ No accounts loaded. Please upload Gmail or SMTP accounts.")
+    st.info("💡 **Quick Start:**\n1. Upload gmail_accounts.json OR smtp_servers.json\n2. Or place files in project root folder\n3. Refresh the app")
     st.stop()
 
+# Validate accounts
 valid_accounts = []
-for acc in accounts:
+for acc in all_accounts:
     provider = acc.get("provider", "").lower()
     if all(k in acc for k in ["email", "password", "name"]) and provider in ALL_SMTP_SETTINGS:
         valid_accounts.append(acc)
     else:
-        st.sidebar.warning(f"Skipping: {acc.get('email', 'N/A')}")
+        st.sidebar.warning(f"⚠️ Skipping invalid: {acc.get('email', 'N/A')}")
 
 if not valid_accounts:
-    st.error("No valid accounts found.")
+    st.error("❌ No valid accounts found. Check JSON format.")
     st.stop()
 
 ensure_sent_counters(valid_accounts)
 
-st.sidebar.header("🎛️ Sending Controls")
+st.sidebar.header("🎛️ Sending Settings")
 daily_limit_per_account = st.sidebar.number_input("Daily limit per account", min_value=1, value=DEFAULT_DAILY_LIMIT)
-sleep_seconds = st.sidebar.number_input("Delay between emails (seconds)", min_value=0.0, value=2.0, step=0.1)
-batch_size = st.sidebar.number_input("Batch size", min_value=10, value=50, step=10)
-batch_delay = st.sidebar.number_input("Batch delay (seconds)", min_value=0, value=10, step=1)
+sleep_seconds = st.sidebar.number_input("Delay between emails (seconds)", min_value=0.0, value=1.0, step=0.1)
+batch_size = st.sidebar.number_input("Batch size", min_value=10, value=100, step=10)
+batch_delay = st.sidebar.number_input("Batch delay (seconds)", min_value=0, value=5, step=1)
 
-# Personalization options
+# Personalization
 st.sidebar.header("✨ Personalization")
 enable_name_personalization = st.sidebar.checkbox("Enable [Recipient Name] replacement", value=True)
-custom_greeting = st.sidebar.text_input("Custom greeting (optional)", placeholder="Dear [Recipient Name],")
+custom_greeting = st.sidebar.text_input("Custom greeting", placeholder="Dear [Recipient Name],")
 
-# Reset button
 if st.sidebar.button("🔄 Reset All Counters"):
     reset_all_counters()
     st.rerun()
@@ -318,8 +404,20 @@ if st.sidebar.button("🔄 Reset All Counters"):
 # -----------------------
 # UI: Main Page
 # -----------------------
-st.header("1. 📤 Senders & Email Content")
+st.header("1. 📤 Select Accounts & Email Content")
 
+# Show account summary
+col1, col2, col3 = st.columns(3)
+with col1:
+    gmail_count = len([a for a in valid_accounts if "gmail" in a.get("provider", "").lower()])
+    st.metric("Gmail Accounts", gmail_count)
+with col2:
+    smtp_count = len(valid_accounts) - gmail_count
+    st.metric("SMTP Servers", smtp_count)
+with col3:
+    st.metric("Total Accounts", len(valid_accounts))
+
+# Account selection
 account_map = {}
 for acc in valid_accounts:
     sent_today = get_sent_today(acc['email'])
@@ -328,17 +426,17 @@ for acc in valid_accounts:
     account_map[label] = acc
 
 selected_labels = st.multiselect(
-    "Select sender accounts:",
+    "Select accounts to use:",
     options=list(account_map.keys()),
     default=list(account_map.keys())
 )
 selected_accounts = [account_map[label] for label in selected_labels]
 
 if not selected_accounts:
-    st.warning("⚠️ Please select at least one sender account.")
+    st.warning("⚠️ Please select at least one account.")
 
 total_capacity = sum(max(0, daily_limit_per_account - get_sent_today(acc['email'])) for acc in selected_accounts)
-st.info(f"📊 Total remaining capacity: **{total_capacity}** emails")
+st.info(f"📊 Total remaining capacity: **{total_capacity:,}** emails")
 
 sender_name_override = st.text_input("Sender Name (optional override)")
 subject = st.text_input("Subject")
@@ -355,9 +453,8 @@ if content != st.session_state.email_body:
 body_html = st.session_state.email_body
 uploaded_attach = st.file_uploader("Optional: Attach File", accept_multiple_files=False)
 
-# Preview personalization
 if enable_name_personalization and "[Recipient Name]" in body_html:
-    st.info("✨ Personalization enabled: [Recipient Name] will be replaced with actual names")
+    st.info("✨ Personalization enabled: [Recipient Name] will be replaced")
 
 st.header("2. 📧 Recipients")
 recipients, recipient_name_map = [], {}
@@ -386,15 +483,15 @@ if pasted:
     recipients.extend([line.strip() for line in pasted.splitlines() if line.strip()])
 
 recipients = sanitize_recipients(recipients)
-st.success(f"✅ Loaded {len(recipients)} unique valid recipients")
+st.success(f"✅ Loaded {len(recipients):,} unique valid recipients")
 
 if recipient_name_map:
-    st.info(f"📝 {len(recipient_name_map)} recipients have names for personalization")
+    st.info(f"📝 {len(recipient_name_map):,} recipients have names for personalization")
 
 if len(recipients) > total_capacity:
-    st.warning(f"⚠️ {len(recipients)} recipients but only {total_capacity} capacity!")
+    st.warning(f"⚠️ {len(recipients):,} recipients but only {total_capacity:,} capacity. Some emails may not be sent.")
 
-st.header("3. 🔍 Tracking")
+st.header("3. 🔍 Tracking & Options")
 enable_open_tracking = st.checkbox("Enable open tracking", value=False)
 tracker_url = st.text_input("Tracker URL (webhook.site)", "")
 enable_unsubscribe = st.checkbox("Add unsubscribe link in footer", value=True)
@@ -451,7 +548,8 @@ def send_via_smtp(account, msg, to_email):
     
     try:
         with smtplib.SMTP(settings['host'], settings['port'], timeout=60) as server:
-            server.starttls()
+            if settings.get('use_tls', True):
+                server.starttls()
             server.login(account["email"], account["password"])
             server.sendmail(account["email"], [to_email], msg.as_string())
         return True, None
@@ -487,142 +585,133 @@ if send_button:
     if not all([subject, body_html, recipients]):
         st.error("❌ Subject, body, and recipients required.")
     elif not selected_accounts:
-        st.error("❌ Select at least one sender account.")
+        st.error("❌ Select at least one account.")
     else:
         st.session_state.is_sending = True
         st.session_state.should_stop = False
         st.session_state.is_paused = False
         
-        account_mgr = AccountManager(selected_accounts, daily_limit_per_account)
+        account_mgr = SMTPAccountManager(selected_accounts, daily_limit_per_account)
         
         total_sent = 0
         total_failed = 0
-        total_skipped = 0
         status_rows = []
         
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
         control_status = st.empty()
+        live_stats = st.empty()
         
         try:
-            num_batches = (len(recipients) + batch_size - 1) // batch_size
-            
-            for batch_num in range(num_batches):
+            for i, recipient in enumerate(recipients):
+                # Check for pause
+                while st.session_state.is_paused:
+                    control_status.warning("⏸️ PAUSED - Click Resume to continue")
+                    time.sleep(1)
+                
+                # Check for stop
                 if st.session_state.should_stop:
                     st.warning("🛑 Sending stopped by user")
                     break
                 
-                batch_start = batch_num * batch_size
-                batch_end = min(batch_start + batch_size, len(recipients))
-                batch_recipients = recipients[batch_start:batch_end]
+                control_status.empty()
                 
-                st.info(f"🔄 Batch {batch_num + 1}/{num_batches} ({len(batch_recipients)} emails)")
+                # Get available account
+                account, error_msg = account_mgr.get_next_available_account()
                 
-                for i, recipient in enumerate(batch_recipients):
-                    # Check for pause
-                    while st.session_state.is_paused:
-                        control_status.warning("⏸️ PAUSED - Click Resume to continue")
-                        time.sleep(1)
-                    
-                    # Check for stop
-                    if st.session_state.should_stop:
-                        break
-                    
-                    control_status.empty()
-                    overall_index = batch_start + i
-                    
-                    # Get available account
-                    account, error_msg = account_mgr.get_next_available_account()
-                    
-                    if account is None:
-                        st.error(f"🚫 {error_msg}")
-                        total_skipped = len(recipients) - overall_index
-                        break
-                    
-                    sender_name = sender_name_override.strip() or account['name']
-                    to_name = recipient_name_map.get(recipient.lower(), "")
-                    uuid_id = str(uuid.uuid4())
-                    
-                    map_uuid_save(uuid_id, recipient, account["email"])
-                    
-                    msg = build_message(sender_name, account["email"], recipient, subject,
-                                      body_html, to_name, uploaded_attach, uuid_id)
-                    
-                    # Try sending with limited retries
-                    retry_count = 0
-                    ok, err = False, None
-                    
-                    while retry_count <= MAX_RETRIES:
-                        ok, err = send_via_smtp(account, msg, recipient)
-                        
-                        if ok:
-                            break
-                        
-                        # Check if rate limited
-                        if is_rate_limit_error(err):
-                            st.warning(f"⚠️ Rate limit detected on {account['email']}")
-                            # Mark account as rate limited and skip it
-                            account_mgr.mark_rate_limited(account['email'])
-                            # Get new account
-                            account, error_msg = account_mgr.get_next_available_account()
-                            if account is None:
-                                st.error("🚫 All accounts rate limited!")
-                                break
-                            # Rebuild message with new account
+                if account is None:
+                    st.error(f"🚫 {error_msg}")
+                    st.warning(f"⚠️ Stopped at {i}/{len(recipients)}. {len(recipients) - i} emails not sent.")
+                    break
+                
+                sender_name = sender_name_override.strip() or account['name']
+                to_name = recipient_name_map.get(recipient.lower(), "")
+                uuid_id = str(uuid.uuid4())
+                
+                map_uuid_save(uuid_id, recipient, account["email"])
+                
+                msg = build_message(sender_name, account["email"], recipient, subject,
+                                  body_html, to_name, uploaded_attach, uuid_id)
+                
+                # Try sending
+                ok, err = send_via_smtp(account, msg, recipient)
+                
+                # Handle errors
+                if not ok:
+                    if is_rate_limit_error(err):
+                        account_mgr.mark_rate_limited(account['email'])
+                        # Retry with next account
+                        account, error_msg = account_mgr.get_next_available_account()
+                        if account:
                             sender_name = sender_name_override.strip() or account['name']
                             msg = build_message(sender_name, account["email"], recipient, 
                                               subject, body_html, to_name, uploaded_attach, uuid_id)
-                            retry_count += 1
-                        else:
-                            break
-                    
-                    # Log result
-                    row = {
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "recipient": recipient,
-                        "name": to_name,
-                        "account": account["email"],
-                        "uuid": uuid_id,
-                        "status": "sent" if ok else "failed",
-                        "error": str(err)[:100] if err else ""
-                    }
-                    append_sent_log(row)
-                    status_rows.append(row)
-                    
-                    if ok:
-                        update_sent_counter(account["email"])
-                        total_sent += 1
-                    else:
-                        total_failed += 1
-                    
-                    # Update progress
-                    pct = int((overall_index + 1) * 100 / len(recipients))
-                    progress_bar.progress(pct)
-                    
-                    # Show status
-                    sent_from = get_sent_today(account['email'])
-                    status_text = f"📧 {overall_index + 1}/{len(recipients)} → "
-                    if to_name:
-                        status_text += f"{to_name} ({recipient}) "
-                    else:
-                        status_text += f"{recipient} "
-                    status_text += f"via {account['email']} ({sent_from}/{daily_limit_per_account}) | "
-                    status_text += "✅ OK" if ok else f"❌ FAIL"
-                    
-                    status_placeholder.text(status_text)
-                    
-                    # Save progress
-                    save_progress_state(overall_index, len(recipients), total_sent, total_failed)
-                    
-                    time.sleep(float(sleep_seconds))
+                            ok, err = send_via_smtp(account, msg, recipient)
+                    elif is_auth_error(err):
+                        account_mgr.mark_failed(account['email'], "Authentication failed")
+                
+                # Log result
+                row = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "recipient": recipient,
+                    "name": to_name,
+                    "account": account["email"],
+                    "provider": account.get("provider", ""),
+                    "uuid": uuid_id,
+                    "status": "sent" if ok else "failed",
+                    "error": str(err)[:200] if err else ""
+                }
+                append_sent_log(row)
+                status_rows.append(row)
+                
+                if ok:
+                    update_sent_counter(account["email"])
+                    total_sent += 1
+                else:
+                    total_failed += 1
+                
+                # Update progress
+                pct = int((i + 1) * 100 / len(recipients))
+                progress_bar.progress(pct)
+                
+                # Live stats
+                with live_stats.container():
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("✅ Sent", total_sent)
+                    with col2:
+                        st.metric("❌ Failed", total_failed)
+                    with col3:
+                        st.metric("📊 Progress", f"{i+1}/{len(recipients)}")
+                    with col4:
+                        success_rate = round((total_sent / (i+1)) * 100, 1) if i > 0 else 0
+                        st.metric("Success Rate", f"{success_rate}%")
+                
+                # Show status
+                sent_from = get_sent_today(account['email'])
+                status_text = f"📧 {i + 1}/{len(recipients)} → "
+                if to_name:
+                    status_text += f"{to_name} ({recipient}) "
+                else:
+                    status_text += f"{recipient} "
+                status_text += f"via {account['email']} ({account['provider']}) "
+                status_text += f"[{sent_from}/{daily_limit_per_account}] | "
+                status_text += "✅ OK" if ok else f"❌ FAIL: {str(err)[:50]}"
+                
+                status_placeholder.text(status_text)
+                
+                # Save progress
+                save_progress_state(i, len(recipients), total_sent, total_failed)
                 
                 # Batch delay
-                if batch_num < num_batches - 1 and not st.session_state.should_stop:
-                    st.info(f"⏸️ Waiting {batch_delay}s before next batch...")
+                if (i + 1) % batch_size == 0 and i < len(recipients) - 1:
+                    st.info(f"⏸️ Batch complete. Waiting {batch_delay}s before next batch...")
                     time.sleep(batch_delay)
+                else:
+                    time.sleep(float(sleep_seconds))
         
         except Exception as ex:
-            st.error(f"💥 Error: {ex}")
+            st.error(f"💥 Critical Error: {ex}")
             import traceback
             st.code(traceback.format_exc())
         
@@ -642,28 +731,81 @@ if send_button:
             with col2:
                 st.metric("❌ Failed", total_failed)
             with col3:
-                st.metric("⏭️ Skipped", total_skipped)
+                st.metric("📊 Total Processed", total_sent + total_failed)
             with col4:
-                st.metric("📊 Total", len(recipients))
+                success_rate = round((total_sent / len(recipients)) * 100, 1) if recipients else 0
+                st.metric("Success Rate", f"{success_rate}%")
             
             # Account status
-            st.subheader("📈 Account Status")
+            st.subheader("📈 Account Status Report")
             account_status = account_mgr.get_status()
-            st.dataframe(pd.DataFrame(account_status))
+            status_df = pd.DataFrame(account_status)
+            st.dataframe(status_df, use_container_width=True)
             
             # Detailed results
-            st.subheader("📋 Detailed Results")
+            st.subheader("📋 Detailed Sending Report")
             if status_rows:
                 results_df = pd.DataFrame(status_rows)
-                st.dataframe(results_df)
+                
+                # Show summary stats
+                col1, col2 = st.columns(2)
+                with col1:
+                    sent_df = results_df[results_df['status'] == 'sent']
+                    st.write("**Sent Emails by Provider:**")
+                    provider_stats = sent_df.groupby('provider').size().reset_index(name='count')
+                    st.dataframe(provider_stats)
+                
+                with col2:
+                    failed_df = results_df[results_df['status'] == 'failed']
+                    if not failed_df.empty:
+                        st.write("**Failed Emails by Provider:**")
+                        failed_stats = failed_df.groupby('provider').size().reset_index(name='count')
+                        st.dataframe(failed_stats)
+                
+                # Show full results
+                st.write("**Full Results:**")
+                st.dataframe(results_df, use_container_width=True)
                 
                 # Download buttons
-                col1, col2 = st.columns(2)
+                st.subheader("📥 Download Reports")
+                col1, col2, col3 = st.columns(3)
+                
                 with col1:
                     if os.path.exists(SENT_LOG_CSV):
                         with open(SENT_LOG_CSV, "rb") as f:
-                            st.download_button("⬇️ Download Log", data=f, file_name=SENT_LOG_CSV)
+                            st.download_button(
+                                "⬇️ Download Full Log", 
+                                data=f, 
+                                file_name=SENT_LOG_CSV,
+                                mime="text/csv"
+                            )
+                
                 with col2:
                     if os.path.exists(MAP_UUID_CSV):
                         with open(MAP_UUID_CSV, "rb") as f:
-                            st.download_button("⬇️ Download UUID Map", data=f, file_name=MAP_UUID_CSV)
+                            st.download_button(
+                                "⬇️ Download UUID Map", 
+                                data=f, 
+                                file_name=MAP_UUID_CSV,
+                                mime="text/csv"
+                            )
+                
+                with col3:
+                    # Export failed emails
+                    if not failed_df.empty:
+                        failed_csv = failed_df.to_csv(index=False)
+                        st.download_button(
+                            "⬇️ Download Failed Emails",
+                            data=failed_csv,
+                            file_name="failed_emails.csv",
+                            mime="text/csv"
+                        )
+            
+            # Cleanup message
+            if total_sent == len(recipients):
+                st.balloons()
+                st.success(f"🎉 All {len(recipients)} emails sent successfully!")
+            elif total_sent > 0:
+                st.info(f"✅ Sent {total_sent} out of {len(recipients)} emails. Check report for details.")
+            else:
+                st.error("❌ No emails were sent. Please check your accounts and try again.")
