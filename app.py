@@ -37,7 +37,7 @@ DEFAULT_SMTP_SETTINGS = {
     "protonmail": {"host": "127.0.0.1", "port": 1025, "use_tls": True},
     "resend": {"host": "smtp.resend.com", "port": 587, "use_tls": True},
     "mailersend": {"host": "smtp.mailersend.net", "port": 587, "use_tls": True},
-    "turboSMTP": {"host": "smtp.mailersend.net", "port": 587, "use_tls": True},
+    "turboSMTP": {"host": "pro.turbo-smtp.com", "port": 587, "use_tls": True},
     "sendgrid": {"host": "smtp.sendgrid.net", "port": 587, "use_tls": True},
     "mailgun": {"host": "smtp.mailgun.org", "port": 587, "use_tls": True}
 }
